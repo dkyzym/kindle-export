@@ -45,7 +45,13 @@ const filtered = rows
     word: word.trim().toLowerCase(),
     count,
     example: usage?.trim() || '',
-    book: title?.trim() || '',
+    book:
+      title
+        ?.trim()
+        .split(' ')
+        .slice(0, 3)
+        .join(' ')
+        .replace(/[^a-zA-Zа-яА-ЯёЁ0-9]+$/g, '') || '',
   }))
   .filter(({ word }) => word && !cyrillic.test(word))
   .sort((a, b) => {
