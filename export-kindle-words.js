@@ -1,14 +1,18 @@
 import Database from 'better-sqlite3';
+import * as dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
+dotenv.config();
 
 // ── helper ──────────────────────────────────────────────────────────────
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // ── Путь к базе данных Kindle ───────────────────────────────────────────
-const dbPath = 'H:/system/vocabulary/vocab.db';
+const dbPath = process.env.BOOK_DB_PATH;
+
 if (!dbPath) {
   console.error(
     '❌ Укажи путь к vocab.db: node export-kindle-words.mjs <path>'
@@ -79,7 +83,7 @@ if (!fs.existsSync(outputDir)) {
 const humanFile = path.join(outputDir, 'words.txt');
 fs.writeFileSync(humanFile, humanOutput, 'utf8');
 
-const jsonFile = path.join(outputDir, 'words_detailed.json');
+const jsonFile = path.join(outputDir, 'words.json');
 fs.writeFileSync(jsonFile, structuredJson, 'utf8');
 
 // ── Финальный вывод ─────────────────────────────────────────────────────
