@@ -3,15 +3,12 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// ── helper для __dirname ──────────────────────────────────────────────
+// ── helper ──────────────────────────────────────────────────────────────
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ── путь к базе ────────────────────────────────────────────────────────
-// Можно передать как аргумент командной строки
-// const dbPath = process.argv[2];
+// ── Путь к базе данных Kindle ───────────────────────────────────────────
 const dbPath = 'H:/system/vocabulary/vocab.db';
-
 if (!dbPath) {
   console.error(
     '❌ Укажи путь к vocab.db: node export-kindle-words.mjs <path>'
@@ -22,10 +19,7 @@ if (!dbPath) {
 const db = new Database(dbPath, { readonly: true });
 const cyrillic = /[\u0400-\u04FF]/;
 
-// ── SQL: получаем базовую форму слова (stem), предложение (usage), и книгу (title) ─────────────
-// COUNT(*) — сколько раз слово встречалось
-// MAX(l.usage) — одно из предложений (самое позднее по времени, как правило)
-// MAX(b.title) — название книги
+// ── SQL: выборка слова, частоты, предложения и книги ────────────────────
 const rows = db
   .prepare(
     `
@@ -45,13 +39,13 @@ const rows = db
   )
   .all();
 
-// ── Преобразуем результат в читаемый формат, фильтруем кириллицу ────────────────
+// ── Обработка и фильтрация ─────────────────────────────────────────────
 const filtered = rows
   .map(({ word, count, usage, title }) => ({
     word: word.trim().toLowerCase(),
     count,
     example: usage?.trim() || '',
-    book: title?.trim().split(':')[0] || '',
+    book: title?.trim() || '',
   }))
   .filter(({ word }) => word && !cyrillic.test(word))
   .sort((a, b) => {
@@ -59,7 +53,7 @@ const filtered = rows
     return cmp !== 0 ? cmp : b.count - a.count;
   });
 
-// ── Читаемый .txt файл ────────────────────────────────────────────────
+// ── Читаемый вывод ──────────────────────────────────────────────────────
 const humanOutput = filtered
   .map(
     ({ word, count, example, book }) =>
@@ -67,17 +61,22 @@ const humanOutput = filtered
   )
   .join('\n\n');
 
-// ── JSON: формат пригодный для AI или Anki ─────────────────────────────
 const structuredJson = JSON.stringify(filtered, null, 2);
 
-// ── Сохраняем оба файла ───────────────────────────────────────────────
-const humanFile = path.join(__dirname, 'words.txt');
+// ── Создаём папку вывода, если не существует ───────────────────────────
+const outputDir = path.join(__dirname, 'output');
+if (!fs.existsSync(outputDir)) {
+  fs.mkdirSync(outputDir, { recursive: true });
+}
+
+// ── Сохраняем результаты ────────────────────────────────────────────────
+const humanFile = path.join(outputDir, 'words.txt');
 fs.writeFileSync(humanFile, humanOutput, 'utf8');
 
-const jsonFile = path.join(__dirname, 'words_detailed.json');
+const jsonFile = path.join(outputDir, 'words_detailed.json');
 fs.writeFileSync(jsonFile, structuredJson, 'utf8');
 
-// ── Готово ─────────────────────────────────────────────────────────────
+// ── Финальный вывод ─────────────────────────────────────────────────────
 console.log(
   `✅ Готово! ${filtered.length} слов сохранено в:\n` +
     ` - ${humanFile} (читаемый формат)\n` +
