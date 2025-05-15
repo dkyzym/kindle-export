@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "ingest": "tsx vocab-cli.ts ingest words.json",
+    "export": "tsx vocab-cli.ts export --tier 1 --batch 30",
     "start": "node export-kindle-words.js"
   },
   "keywords": [],
@@ -13,6 +14,21 @@
   "type": "module",
   "dependencies": {
     "better-sqlite3": "^11.9.1",
-    "dotenv": "^16.5.0"
+    "dotenv": "^16.5.0",
+    "fs-extra": "^11.3.0",
+    "natural": "^8.0.1",
+    "subtlex-word-frequencies": "^2.0.0",
+    "wink-lemmatizer": "^3.0.4",
+    "word-freq": "^0.0.8",
+    "wordfreq": "^0.1.0-dev",
+    "wordpos": "^2.1.0",
+    "yargs": "^17.7.2"
+  },
+  "devDependencies": {
+    "@types/natural": "^5.1.5",
+    "@types/node": "^22.15.18",
+    "@types/yargs": "^17.0.33",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
   }
 }

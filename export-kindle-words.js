@@ -74,7 +74,7 @@ const humanOutput = filtered
 const structuredJson = JSON.stringify(filtered, null, 2);
 
 // ── Создаём папку вывода, если не существует ───────────────────────────
-const outputDir = path.join(__dirname, 'output');
+const outputDir = path.join(__dirname, 'data');
 if (!fs.existsSync(outputDir)) {
   fs.mkdirSync(outputDir, { recursive: true });
 }
