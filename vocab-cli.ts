@@ -1,10 +1,5 @@
 // vocab-cli.ts – resilient CLI (ESM/CJS) for Kindle → Anki
 // -----------------------------------------------------------------------------
-// Zero‑friction version:  runs even если нет data‑файлов.
-//   • Если stop/cefr/zipf JSON не найдены или пустые → скрипт выдаёт warning и
-//     продолжает работу с «заглушками» (stop = ∅, cefr = B2, zipf = 3.5).
-//   • Все зависимости доступны на npm и имеют типы (кроме wink‑lemmatizer).
-// -----------------------------------------------------------------------------
 // npm install natural wink-lemmatizer fs-extra yargs
 // npm i -D tsx typescript @types/node @types/natural @types/yargs
 // -----------------------------------------------------------------------------
@@ -12,9 +7,10 @@
 // {
 //   "compilerOptions": {
 //     "target": "ES2020",
-//     "module": "ESNext",
+//     "module": "NodeNext",
 //     "moduleResolution": "NodeNext",
 //     "esModuleInterop": true,
+//     "forceConsistentCasingInFileNames": true,
 //     "strict": true,
 //     "skipLibCheck": true
 //   }
@@ -31,14 +27,12 @@ import { fileURLToPath } from 'url';
 import { hideBin } from 'yargs/helpers';
 import yargs from 'yargs/yargs';
 
-// natural is CJS → dynamic import to keep ESM compatibility
 const naturalMod: any = await import('natural');
 const { WordNet, PorterStemmer } = (naturalMod.default ??
   naturalMod) as typeof import('natural');
 // @ts-ignore wink‑lemmatizer has no types
 import lemmatizer from 'wink-lemmatizer';
 
-// ---------- Helpers ----------
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_PATH = path.join(__dirname, 'data');
 const DATA = (p: string) => path.join(DATA_PATH, p);
@@ -47,12 +41,11 @@ async function safeJsonRead<T>(file: string, fallback: T): Promise<T> {
   try {
     const txt = await fs.readFile(file, 'utf8');
     return JSON.parse(txt) as T;
-  } catch (e) {
+  } catch {
     console.warn(`[warn] cannot load ${path.basename(file)} – using fallback`);
     return fallback;
   }
 }
-
 async function loadStop(): Promise<Set<string>> {
   try {
     const txt = await fs.readFile(DATA('stop_en.txt'), 'utf8');
@@ -62,13 +55,14 @@ async function loadStop(): Promise<Set<string>> {
     return new Set<string>();
   }
 }
-
 const loadCefr = () =>
-  safeJsonRead<Record<string, string>>(DATA('cefr_map.json'), {});
+  safeJsonRead<Record<string, { level: string; pos?: string }>>(
+    DATA('cefr_map.json'),
+    {}
+  );
 const loadZipf = () =>
   safeJsonRead<Record<string, number>>(DATA('subtlex_zipf.json'), {});
 
-// ---------- WordNet helper ----------
 const wn = new WordNet();
 function lookup(
   word: string
@@ -89,7 +83,6 @@ function lookup(
   });
 }
 
-// ---------- Types ----------
 interface KindleWord {
   word: string;
   count?: number;
@@ -102,37 +95,34 @@ interface TierWord {
   level: string;
   zipf: number;
   tier: 1 | 2 | 3;
+  pos: string;
   example?: string;
 }
 
-// ---------- Ingest ----------
 async function ingest(file: string) {
   await mkdir(DATA_PATH, { recursive: true });
-
   const stop = await loadStop();
   const cefr = await loadCefr();
   const zipfAll = await loadZipf();
-
   const raw = JSON.parse(await fs.readFile(file, 'utf8')) as KindleWord[];
   const seen = new Set<string>();
   const out: TierWord[] = [];
-
   for (const { word, example } of raw) {
     if (!word) continue;
     const w = word.toLowerCase();
     if (seen.has(w) || stop.has(w)) continue;
     seen.add(w);
-
     const lemma = (lemmatizer as any).lemmatize
       ? (lemmatizer as any).lemmatize(w)
       : PorterStemmer.stem(w);
-    const level = cefr[lemma] ?? 'B2';
+    const ce = cefr[lemma] as { level: string; pos?: string } | undefined;
+    const level = ce?.level ?? 'B2';
+    const pos = ce?.pos ?? '';
     const zipf = zipfAll[lemma] ?? 3.5;
-    const tier: 1 | 2 | 3 = level >= 'B2' && zipf < 4 ? 1 : zipf < 5 ? 2 : 3;
-
-    out.push({ word: w, lemma, level, zipf, tier, example });
+    const lvlRank = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'].indexOf(level);
+    const tier: 1 | 2 | 3 = lvlRank >= 3 && zipf < 4 ? 1 : zipf < 5 ? 2 : 3;
+    out.push({ word: w, lemma, level, zipf, tier, pos, example });
   }
-
   await fs.writeFile('cleaned-words.json', JSON.stringify(out, null, 2));
   const stat = { 1: 0, 2: 0, 3: 0 } as Record<1 | 2 | 3, number>;
   out.forEach((x) => stat[x.tier]++);
@@ -141,30 +131,27 @@ async function ingest(file: string) {
   );
 }
 
-// ---------- Export ----------
 async function exportBatch(tier: number, batch: number) {
   let arr: TierWord[] = [];
   try {
     arr = JSON.parse(await fs.readFile('cleaned-words.json', 'utf8'));
-  } catch (e) {
+  } catch {
     console.error('cleaned-words.json not found. Run "ingest" first.');
     process.exit(1);
   }
-
   const slice = arr.filter((x) => x.tier === tier).slice(0, batch);
   if (!slice.length) {
     console.error(`No words found for Tier ${tier}.`);
     return;
   }
-
   const rows: string[] = [];
   for (const w of slice) {
     const { def, syns, pos } = await lookup(w.word);
+    const finalPos = w.pos || pos;
     const example = (w.example ?? '').slice(0, 120);
-
     rows.push(
       [
-        `${w.word} (${pos})`,
+        `${w.word} (${finalPos})`,
         '',
         def,
         example,
@@ -175,13 +162,11 @@ async function exportBatch(tier: number, batch: number) {
         .join('\t')
     );
   }
-
   const name = `deck_t${tier}_${Date.now()}.tsv`;
   await fs.writeFile(name, rows.join('\n'));
   console.log(`Saved ${rows.length} cards → ${name}`);
 }
 
-// ---------- CLI ----------
 const argv = yargs(hideBin(process.argv))
   .command('ingest <file>', 'clean + tier', (y) =>
     y.positional('file', { type: 'string' })
