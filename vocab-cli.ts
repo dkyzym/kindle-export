@@ -1,10 +1,10 @@
 #!/usr/bin/env tsx
 /* Kindle → Anki CLI
  * ─────────────────────────────────────────────────────────
- * 1)  ingest <words.json>          → data/cleaned-words.json
- * 2)  export --tier N [--batch K]  → data/decks/deck_tN_??.tsv
- *    – batch = 30 по умолчанию     (или --batch 50)
- *    – синонимы и дефиниции берутся из WordNet (natural + wordnet-db)
+ * 1)  ingest <words.json>         → data/cleaned-words.json
+ * 2)  export --tier N [--batch K] → data/decks/deck_tN_??.tsv
+ * – batch = 30 по умолчанию   (или --batch 50)
+ * – синонимы и дефиниции берутся из WordNet (natural + wordnet-db)
  * ------------------------------------------------------- */
 
 import fs from 'fs-extra';
@@ -69,7 +69,7 @@ const readLines = async (p: string): Promise<Set<string>> => {
 /* ───── Zipf map (build once, then cache as JSON) ────── */
 const ensureZipfMap = async (): Promise<Record<string, number>> => {
   const cached = await readJSON<Record<string, number>>(ZIPF_JSON);
-  if (Object.keys(cached).length) return cached;
+  if (cached && Object.keys(cached).length) return cached; // Check if cached is not null
 
   if (!(await fs.pathExists(SUBTLEX_XLSX))) {
     console.warn('⚠ SUBTLEX-US.xlsx missing – Zipf fallback 3.5');
@@ -111,7 +111,7 @@ const ensureCefrMap = async (): Promise<
 /* ───── Lemma chooser ───── */
 const chooseLemma = (
   w: string,
-  cefr: Record<string, unknown>,
+  cefr: Record<string, { level: string; pos?: string }>, // Ensure cefr type is more specific if possible
   zipf: Record<string, number>
 ): string => {
   const variants = [
@@ -151,14 +151,15 @@ const ingest = async (filePath: string) => {
     readLines(STOP_TXT),
     readLines(KNOWN_TXT),
   ]);
-  const raw: RawWord[] = await fs.readJSON(filePath);
+  const rawWords: RawWord[] = await fs.readJSON(filePath);
 
   const seen = new Set<string>();
   let skippedStop = 0,
     skippedDup = 0;
 
-  const cleaned: CleanEntry[] = raw
+  const cleaned: CleanEntry[] = rawWords
     .map((r) => {
+      if (!r.word) return; // Skip if word is missing
       const wlower = r.word.toLowerCase();
       if (stop.has(wlower)) {
         skippedStop++;
@@ -186,7 +187,7 @@ const ingest = async (filePath: string) => {
         level: meta?.level ?? 'B2',
         pos: meta?.pos ?? '',
         zipf: z,
-        tier: 3,
+        tier: 3, // Default tier, will be updated
       };
       entry.tier = decideTier(entry);
       return entry;
@@ -213,115 +214,182 @@ const lookupAsync = (lemma: string): Promise<any[]> =>
 
 const pad = (n: number, w = 2) => String(n).padStart(w, '0');
 
+// Determines the next batch number (e.g., 1 for the first batch, 2 for the second)
 const nextBatchId = async (tier: number) => {
   const deckDir = path.join(DATA_DIR, 'decks');
   await fs.ensureDir(deckDir);
-  const ids = (await fs.readdir(deckDir))
+  const files = await fs.readdir(deckDir);
+  const ids = files
     .filter((f) => f.startsWith(`deck_t${tier}_`) && f.endsWith('.tsv'))
-    .map((f) => Number(/_(\d+)\.tsv$/.exec(f)?.[1] ?? 0));
-  return Math.max(0, ...ids) + 1;
+    .map((f) => {
+      const match = /_(\d+)\.tsv$/.exec(f);
+      return match?.[1] ? Number(match[1]) : 0;
+    })
+    .filter((id) => id > 0); // Ensure only valid positive numbers are considered
+
+  if (ids.length === 0) return 1; // No existing batches, start with 1
+  return Math.max(...ids) + 1; // Next batch number
 };
 
 const exportTier = async (tier: 1 | 2 | 3, batchSize = 30) => {
   if (!(await fs.pathExists(CLEANED_JSON))) {
-    console.warn('⚠ Run ingest first.');
+    console.warn('⚠ Run ingest first. Cleaned words JSON not found.');
     return;
   }
-  const all: CleanEntry[] = await readJSON(CLEANED_JSON);
-  const list = all
+  const allCleanedWords: CleanEntry[] = await readJSON(CLEANED_JSON);
+  if (!allCleanedWords || !Array.isArray(allCleanedWords)) {
+    console.warn('⚠ Cleaned words data is invalid or empty.');
+    return;
+  }
+
+  // Filter words for the specified tier and sort them
+  const wordsForTier = allCleanedWords
     .filter((e) => e.tier === tier)
-    .sort((a, b) => (b.count ?? 0) - (a.count ?? 0))
-    .slice(0, batchSize);
+    .sort((a, b) => (b.count ?? 0) - (a.count ?? 0));
 
-  console.log('Batch size', list.length);
+  // Determine the current batch number (1 for first, 2 for second, etc.)
+  // This is done *before* slicing to ensure we get the correct segment of words.
+  const currentBatchNum = await nextBatchId(tier);
 
-  if (!list.length) {
-    console.warn(`⚠ Tier ${tier} empty`);
+  const startIndex = (currentBatchNum - 1) * batchSize;
+  const endIndex = currentBatchNum * batchSize;
+
+  // Slice the sorted words to get the current batch
+  const currentBatchList = wordsForTier.slice(startIndex, endIndex);
+
+  console.log(
+    `Preparing batch #${currentBatchNum} for tier ${tier}. Aiming for ${batchSize} words.`
+  );
+
+  if (!currentBatchList.length) {
+    console.warn(
+      `⚠ Tier ${tier} has no more words to export for batch #${currentBatchNum} (startIndex: ${startIndex}, total for tier: ${wordsForTier.length}).`
+    );
     return;
   }
+  console.log(
+    `Selected ${
+      currentBatchList.length
+    } words for this batch (from index ${startIndex} to ${endIndex - 1}).`
+  );
 
   const wnCache = new Map<string, { def: string; syn: string[] }>();
-  const limit = pLimit(8);
+  const limit = pLimit(8); // Limit concurrent WordNet lookups
 
-  const tasks = list.map((e) =>
+  // Asynchronously fetch definitions and synonyms from WordNet
+  const tasks = currentBatchList.map((entry) =>
     limit(async () => {
-      if (wnCache.has(e.lemma)) return wnCache.get(e.lemma)!;
+      if (wnCache.has(entry.lemma)) return wnCache.get(entry.lemma)!;
 
-      let def = '',
-        syn: string[] = [];
+      let definition = '';
+      let synonyms: string[] = [];
       try {
-        const res: any[] = await lookupAsync(e.lemma);
-        if (Array.isArray(res) && res.length) {
-          def = res[0].def.split(';')[0];
+        const results: any[] = await lookupAsync(entry.lemma);
+        if (Array.isArray(results) && results.length) {
+          definition = results[0].def.split(';')[0].trim(); // Take first definition part
 
-          const raw = res
+          const rawSynonyms = results
             .flatMap((r) => r.synonyms)
-            .map((s) => s.trim().toLowerCase()); // ← trim+lc
-          const uniq = [...new Set(raw)]; // ← убрать дубли
-          const filtered = uniq.filter((s) => s !== e.lemma); // e.lemma уже lc
+            .map((s: string) => s.trim().toLowerCase().replace(/_/g, ' ')); // Trim, lowercase, replace underscores
+          const uniqueSynonyms = [...new Set(rawSynonyms)];
+          const filteredSynonyms = uniqueSynonyms.filter(
+            (s) => s !== entry.lemma.toLowerCase()
+          ); // Exclude the lemma itself
 
-          syn = (filtered.length ? filtered : uniq).slice(0, 3);
+          synonyms = (
+            filteredSynonyms.length ? filteredSynonyms : uniqueSynonyms
+          ).slice(0, 3); // Max 3 synonyms
         }
       } catch (err) {
-        console.error('WordNet error', e.lemma, err);
+        console.error(`Error looking up '${entry.lemma}' in WordNet:`, err);
       }
 
-      const out = { def, syn }; // всегда формируем объект
-      wnCache.set(e.lemma, out);
-
-      return out; // ← гарантированный return
+      const wordNetData = { def: definition, syn: synonyms };
+      wnCache.set(entry.lemma, wordNetData);
+      return wordNetData;
     })
   );
 
-  const defs = await Promise.all(tasks);
+  const wordNetResults = await Promise.all(tasks);
 
-  const deckLines = list.map((e, i) =>
+  // Prepare lines for the TSV file
+  const deckLines = currentBatchList.map((entry, index) =>
     [
-      `${e.word} (${e.pos})`,
-      '',
-      defs[i].def,
-      (e.example ?? '').slice(0, 120),
-      defs[i].syn.join(', '),
-      `Tier${tier}·${e.level}·Zipf ${e.zipf.toFixed(2)}`,
+      `${entry.word} (${entry.pos || 'N/A'})`, // Word (POS)
+      '', // Placeholder, can be used for audio or images
+      wordNetResults[index].def, // Definition
+      (entry.example ?? '').slice(0, 120), // Example sentence (truncated)
+      wordNetResults[index].syn.join(', '), // Synonyms
+      `Tier${tier}·${entry.level}·Zipf ${entry.zipf.toFixed(2)}`, // Tags
     ].join('\t')
   );
 
   const deckDir = path.join(DATA_DIR, 'decks');
-  await fs.ensureDir(deckDir);
-  const fname = path.join(
+  await fs.ensureDir(deckDir); // Ensure 'decks' directory exists
+
+  // Use the currentBatchNum (determined earlier) for the filename
+  const filename = path.join(
     deckDir,
-    `deck_t${tier}_${pad(await nextBatchId(tier))}.tsv`
+    `deck_t${tier}_${pad(currentBatchNum)}.tsv`
   );
-  await fs.writeFile(fname, deckLines.join('\n'));
-  console.log(`✓ deck ${path.basename(fname)} created (${deckLines.length})`);
+
+  await fs.writeFile(filename, deckLines.join('\n'));
+  console.log(
+    `✓ Deck created: ${path.basename(filename)} (${deckLines.length} words)`
+  );
 };
 
 /* ────────────── CLI ─────────────────────────────────── */
 yargs(hideBin(process.argv))
   .command(
     'ingest <file>',
-    'Parse Kindle words',
-    (y) => y.positional('file', { type: 'string' }),
-    (a) => ingest(path.resolve(String(a.file)))
+    'Parse Kindle words from JSON and prepare them.',
+    (y) =>
+      y.positional('file', {
+        describe: 'Path to the JSON file containing words (e.g., vocab.json)',
+        type: 'string',
+        demandOption: 'Please provide the path to the words JSON file.',
+      }),
+    (argv) => {
+      if (!argv.file) {
+        console.error(
+          'Error: Missing required argument <file> for ingest command.'
+        );
+        process.exit(1);
+      }
+      ingest(path.resolve(String(argv.file)));
+    }
   )
   .command(
     'export',
-    'Create Anki deck',
+    'Create Anki deck (TSV file) from processed words.',
     (y) =>
       y
         .option('tier', {
+          describe: 'The learning tier to export words from.',
           type: 'number',
-          choices: [1, 2, 3],
-          demandOption: true,
+          choices: [1, 2, 3] as const, // Ensure choices are treated as literal types
+          demandOption: 'Please specify a tier (1, 2, or 3).',
         })
         .option('batch', {
+          describe: 'Maximum number of words per deck file.',
           type: 'number',
-          describe: 'how many words',
           default: 30,
         }),
-    (a) => exportTier(a.tier as 1 | 2 | 3, a.batch as number)
+    (argv) => {
+      // Type assertion for tier as yargs choices might not fully narrow it
+      const tier = argv.tier as 1 | 2 | 3;
+      const batchSize = argv.batch as number;
+      exportTier(tier, batchSize);
+    }
   )
-  .demandCommand(1)
-  .strict()
-  .help()
+  .demandCommand(
+    1,
+    'You need to specify at least one command (ingest or export).'
+  )
+  .strict() // Catches unrecognized options
+  .help('h')
+  .alias('h', 'help')
+  .alias('v', 'version')
+  .epilog('For more information, visit the repository.')
   .parse();
