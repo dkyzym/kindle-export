@@ -22,11 +22,13 @@
     "word-freq": "^0.0.8",
     "wordfreq": "^0.1.0-dev",
     "wordpos": "^2.1.0",
+    "xlsx": "^0.18.5",
     "yargs": "^17.7.2"
   },
   "devDependencies": {
     "@types/natural": "^5.1.5",
     "@types/node": "^22.15.18",
+    "@types/xlsx": "^0.0.35",
     "@types/yargs": "^17.0.33",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3"
