@@ -1,12 +1,15 @@
 #!/usr/bin/env tsx
 /* Kindle → Anki CLI
  * ─────────────────────────────────────────────────────────
- * 1)  ingest <words.json>       → data/cleaned-words.json
- * 2)  export --tier N [--batch K] → data/decks/deck_tN_??.tsv
- * – batch = 30 по умолчанию   (или --batch 50)
+ * 1)  ingest <words.json>       → data/cleaned-words.json
+ * 2)  export --tier N [--batch K] → data/decks/deck_tN_??.tsv
+ * – batch = 30 по умолчанию   (или --batch 50)
  * – синонимы и дефиниции берутся из WordNet (natural + wordnet-db)
  * ------------------------------------------------------- */
 
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore compromise ships w/o full TS types
+import nlp from 'compromise';
 import fs from 'fs-extra';
 import pLimit from 'p-limit';
 import path from 'path';
@@ -57,7 +60,102 @@ interface CleanEntry extends RawWord {
   tier: 1 | 2 | 3;
 }
 
+interface WNResult {
+  pos: string;
+  def: string;
+  synonyms: string[];
+  meta?: { freqCnt?: number }; // есть в wordnet-db
+}
+
 /* ────────────── Helpers ─────────────────────────────── */
+
+// ── выбрали наиболее частотный sense, желательно нужной POS ─────────
+
+/** Быстрая попытка угадать POS по примеру */
+/** Определяем POS из примера: plural-noun и participle-adjective ловим вручную */
+const posFromExample = (example: string, lemma: string): string => {
+  if (!example) return '';
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const doc: any = nlp(example);
+
+  // 1) примитивный plural-noun  (beads  ↔  bead)
+  const pluralForm = lemma.endsWith('s') ? lemma + 'es' : lemma + 's'; // work → works, bead → beads
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const termPlural: any = doc.match(pluralForm).terms().get(0);
+
+  // 2) exact lemma
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const termExact: any = doc.match(lemma).terms().get(0);
+
+  // 3) fallback: первый токен с тем же текстом
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const term: any =
+    termExact ||
+    termPlural ||
+    doc.termList().find((t: any) => t.text === lemma);
+
+  if (!term) return '';
+
+  if (term.tags?.Noun) return 'noun';
+  if (term.tags?.Verb) {
+    // причастие -ed, -ing → чаще всего adj
+    if (lemma.endsWith('ed') || lemma.endsWith('ing')) return 'adjective';
+    return 'verb';
+  }
+  if (term.tags?.Adjective) return 'adjective';
+  if (term.tags?.Adverb) return 'adverb';
+  return '';
+};
+
+function pickBestSense(results: WNResult[], desiredPos = ''): WNResult | null {
+  if (!results?.length) return null;
+
+  const samePos = desiredPos
+    ? results.filter((r) => mapWordNetPosToStandard(r.pos) === desiredPos)
+    : [];
+
+  // сортируем по freqCnt (больше → чаще)
+  const sorted = (samePos.length ? samePos : results).sort(
+    (a, b) => (b.meta?.freqCnt ?? 0) - (a.meta?.freqCnt ?? 0)
+  );
+
+  let best = sorted[0] ?? null;
+
+  /* NEW: если просили noun, а нашли adj-sense (boon), пробуем найти noun-sense */
+  if (
+    desiredPos === 'noun' &&
+    best &&
+    mapWordNetPosToStandard(best.pos) !== 'noun'
+  ) {
+    const nounSense = sorted.find(
+      (r) => mapWordNetPosToStandard(r.pos) === 'noun'
+    );
+    if (nounSense) best = nounSense;
+  }
+  return best;
+}
+
+// Helper function to map WordNet POS tags to standard strings
+const mapWordNetPosToStandard = (wnPosTag: string | undefined): string => {
+  switch (wnPosTag?.toLowerCase()) {
+    case 'n':
+      return 'noun';
+    case 'v':
+      return 'verb';
+    case 'a':
+      return 'adjective'; // Adjective
+    case 's':
+      return 'adjective'; // Adjective satellite
+    case 'r':
+      return 'adverb';
+    default:
+      return ''; // Return empty if unknown or undefined
+  }
+};
+
+const wnPosCache = new Map<string, string>();
+
 const readJSON = async <T>(p: string): Promise<T> =>
   (await fs.readJSON(p, { throws: false })) as T;
 
@@ -74,7 +172,7 @@ const readLines = async (p: string): Promise<Set<string>> => {
 /* ───── Zipf map (build once, then cache as JSON) ────── */
 const ensureZipfMap = async (): Promise<Record<string, number>> => {
   const cached = await readJSON<Record<string, number>>(ZIPF_JSON);
-  if (cached && Object.keys(cached).length) return cached; // Check if cached is not null
+  if (cached && Object.keys(cached).length) return cached;
 
   if (!(await fs.pathExists(SUBTLEX_XLSX))) {
     console.warn('⚠ SUBTLEX-US.xlsx missing – Zipf fallback 3.5');
@@ -148,9 +246,17 @@ const decideTier = (
   return 3;
 };
 
+/* WordNet instance and lookup function (globally available for ingest and export) */
+const WordNet = (natural as any).WordNet;
+const wn = new WordNet((wordnetDb as any).path);
+const lookupAsync = (lemma: string): Promise<any[]> =>
+  new Promise((resolve) =>
+    wn.lookup(lemma, (results: any[]) => resolve(results ?? []))
+  );
+
 /* ────────────── ingest <words.json> ─────────────────── */
 const ingest = async (filePath: string) => {
-  await fs.ensureDir(DATA_DIR); // Ensure data directory exists
+  await fs.ensureDir(DATA_DIR);
 
   const [cefr, zipf, stop, known] = await Promise.all([
     ensureCefrMap(),
@@ -163,73 +269,120 @@ const ingest = async (filePath: string) => {
   const seen = new Set<string>();
   const loggedStopWords: string[] = [];
   const loggedDuplicateLemmas: string[] = [];
-  let skippedStop = 0, // Counter for stop words/lemmas
-    skippedDup = 0; // Counter for duplicate lemmas
+  let skippedStop = 0,
+    skippedDup = 0;
 
-  const cleaned: CleanEntry[] = rawWords
-    .map((r) => {
-      // Skip if word is missing or effectively empty (e.g., only whitespace)
+  // Limit for concurrent WordNet lookups during ingest
+  const wnLookupLimit = pLimit(8);
+
+  // Process words, making the map callback async to use await for WordNet lookup
+  const cleanedPromises = rawWords.map((r) =>
+    wnLookupLimit(async () => {
+      // Apply pLimit to the async operation
       if (!r.word || r.word.trim() === '') {
-        // console.warn(`Skipping entry with missing or empty word: ${JSON.stringify(r)}`); // Optional: for debugging input
-        return;
+        return undefined; // Explicitly return undefined for later filtering
       }
       const wlower = r.word.toLowerCase();
 
-      // Check if the lowercase word itself is a stop word
       if (stop.has(wlower)) {
         skippedStop++;
         loggedStopWords.push(wlower);
-        return;
+        return undefined;
       }
 
-      // Determine the lemma for the word
       const lemma = chooseLemma(wlower, cefr, zipf);
 
-      // Check if the lemma is a stop word
       if (stop.has(lemma)) {
         skippedStop++;
-        // Log both original word and its lemma if the lemma was the stop word
         loggedStopWords.push(`${wlower} (lemma: ${lemma})`);
-        return;
+        return undefined;
       }
 
-      // Check if the lemma has already been seen (duplicate)
-      // This check is done before the 'known' check as per original logic.
-      // If a word is a duplicate, it's logged as such.
       if (seen.has(lemma)) {
         skippedDup++;
         loggedDuplicateLemmas.push(lemma);
-        return;
+        return undefined;
       }
 
-      // Check if the lemma is in the list of known words
-      // If known, skip without logging as duplicate or adding to 'seen' for further processing.
       if (known.has(lemma)) {
-        return;
+        return undefined;
       }
 
-      // If the lemma is not a stop word, not a duplicate, and not known, add it to 'seen'
       seen.add(lemma);
 
-      // Get CEFR metadata and Zipf score
-      const meta = cefr[lemma];
-      const z = zipf[wlower] ?? zipf[lemma] ?? 3.5; // Fallback Zipf score
+      const cefrDataForLemma = cefr[lemma];
+      const z = zipf[wlower] ?? zipf[lemma] ?? 3.5;
 
-      // Create the clean entry object
+      // 1️⃣  ——— часть речи: WordNet → heur → CEFR ———
+      let finalPos = '';
+
+      // (а) сначала WordNet с кэшем
+      if (wnPosCache.has(lemma)) {
+        finalPos = wnPosCache.get(lemma)!;
+      } else {
+        try {
+          const wnResults = await lookupAsync(lemma);
+          if (wnResults?.length) {
+            finalPos = mapWordNetPosToStandard(wnResults[0].pos);
+          }
+          wnPosCache.set(lemma, finalPos); // кэшируем даже '', чтобы не дёргать повторно
+        } catch (err) {
+          console.error(`WordNet error for '${lemma}':`, err);
+        }
+      }
+
+      // (б) лёгкая эвристика (совсем редкие случаи)
+      if (!finalPos) {
+        if (lemma.endsWith('ly')) finalPos = 'adverb';
+        else if (lemma.endsWith('ing') || lemma.endsWith('ed'))
+          finalPos = 'verb';
+        else if (lemma.endsWith('ness') || lemma.endsWith('tion'))
+          finalPos = 'noun';
+        else if (
+          lemma.endsWith('ous') ||
+          lemma.endsWith('ive') ||
+          lemma.endsWith('ful')
+        )
+          finalPos = 'adjective';
+      }
+
+      // (в) fallback → CEFR
+      const cefrPos = cefrDataForLemma?.pos ?? '';
+      if (!finalPos && cefrPos) finalPos = cefrPos;
+
+      // (г) логировать расхождения (необязательно, но полезно)
+      if (finalPos && cefrPos && finalPos !== cefrPos) {
+        fs.appendFile(
+          path.join(DATA_DIR, 'cefr_pos_mismatches.log'),
+          `${lemma}\tWN:${finalPos}\tCEFR:${cefrPos}\n`
+        ).catch(() => {}); // не тормозим ingest
+      }
+
+      // (д) если у слова есть пример — сверяем с контекстом
+      if (r.example) {
+        const ctxPos = posFromExample(r.example, lemma);
+        if (ctxPos && ctxPos !== finalPos) finalPos = ctxPos;
+      }
+
       const entry: CleanEntry = {
-        ...r, // Spread original raw word properties (includes original 'word' casing, 'example', 'count')
+        ...r,
         lemma,
-        level: meta?.level ?? 'B2', // Default CEFR level
-        pos: meta?.pos ?? '', // Default Part of Speech
+        level: cefrDataForLemma?.level ?? 'B2',
+        pos: finalPos, // Use the potentially WordNet-enhanced POS
         zipf: z,
-        tier: 3, // Default tier, will be updated by decideTier
+        tier: 3,
       };
-      entry.tier = decideTier(entry); // Determine the learning tier
+      entry.tier = decideTier(entry);
       return entry;
     })
-    .filter(Boolean) as CleanEntry[]; // Filter out any undefined entries from skipped words
+  );
 
-  // Write logged stop words to a file
+  // Wait for all promises to resolve and filter out undefined entries
+  const processedEntries = await Promise.all(cleanedPromises);
+  const cleaned: CleanEntry[] = processedEntries.filter(
+    Boolean
+  ) as CleanEntry[];
+
   if (loggedStopWords.length > 0) {
     await fs.writeFile(SKIPPED_STOP_WORDS_FILE, loggedStopWords.join('\n'));
     console.log(
@@ -239,7 +392,6 @@ const ingest = async (filePath: string) => {
     );
   }
 
-  // Write logged duplicate lemmas to a file
   if (loggedDuplicateLemmas.length > 0) {
     await fs.writeFile(
       SKIPPED_DUPLICATE_LEMMAS_FILE,
@@ -254,10 +406,8 @@ const ingest = async (filePath: string) => {
     );
   }
 
-  // Write the cleaned words to the main JSON output file
   await fs.writeJSON(CLEANED_JSON, cleaned, { spaces: 0 });
 
-  // Calculate tier distributions for the console log
   const t1 = cleaned.filter((e) => e.tier === 1).length;
   const t2 = cleaned.filter((e) => e.tier === 2).length;
   console.log(
@@ -269,35 +419,27 @@ const ingest = async (filePath: string) => {
 };
 
 /* ────────────── export --tier N [--batch K] ─────────── */
-const WordNet = (natural as any).WordNet;
-const wn = new WordNet((wordnetDb as any).path); // Initialize WordNet
-const lookupAsync = (lemma: string): Promise<any[]> =>
-  new Promise((resolve) =>
-    wn.lookup(lemma, (results: any[]) => resolve(results ?? []))
-  );
+// WordNet instance and lookupAsync are already defined globally
 
-// Helper to pad numbers for filenames (e.g., 1 -> 01)
 const pad = (n: number, w = 2) => String(n).padStart(w, '0');
 
-// Determines the next batch number for a given tier
 const nextBatchId = async (tier: number): Promise<number> => {
   const deckDir = path.join(DATA_DIR, 'decks');
-  await fs.ensureDir(deckDir); // Ensure the 'decks' directory exists
+  await fs.ensureDir(deckDir);
   const files = await fs.readdir(deckDir);
   const ids = files
     .filter((f) => f.startsWith(`deck_t${tier}_`) && f.endsWith('.tsv'))
     .map((f) => {
-      const match = /_(\d+)\.tsv$/.exec(f); // Regex to extract batch number
+      const match = /_(\d+)\.tsv$/.exec(f);
       return match?.[1] ? Number(match[1]) : 0;
     })
-    .filter((id) => id > 0); // Consider only valid positive batch numbers
+    .filter((id) => id > 0);
 
-  if (ids.length === 0) return 1; // If no batches exist, start with batch 1
-  return Math.max(...ids) + 1; // Otherwise, increment the highest existing batch number
+  if (ids.length === 0) return 1;
+  return Math.max(...ids) + 1;
 };
 
 const exportTier = async (tier: 1 | 2 | 3, batchSize = 30) => {
-  // Check if cleaned words data exists
   if (!(await fs.pathExists(CLEANED_JSON))) {
     console.warn('⚠ Run ingest first. Cleaned words JSON not found.');
     return;
@@ -312,26 +454,19 @@ const exportTier = async (tier: 1 | 2 | 3, batchSize = 30) => {
     return;
   }
 
-  // Filter words for the specified tier and sort them by count (descending)
   const wordsForTier = allCleanedWords
     .filter((e) => e.tier === tier)
     .sort((a, b) => (b.count ?? 0) - (a.count ?? 0));
 
-  // Determine the batch number for the current export operation
   const currentBatchNum = await nextBatchId(tier);
-
-  // Calculate start and end indices for slicing the current batch
   const startIndex = (currentBatchNum - 1) * batchSize;
   const endIndex = currentBatchNum * batchSize;
-
-  // Slice the sorted words to get the list for the current batch
   const currentBatchList = wordsForTier.slice(startIndex, endIndex);
 
   console.log(
     `Preparing batch #${currentBatchNum} for tier ${tier}. Aiming for ${batchSize} words.`
   );
 
-  // If no words are found for the current batch, warn and exit
   if (!currentBatchList.length) {
     console.warn(
       `⚠ Tier ${tier} has no more words to export for batch #${currentBatchNum} (startIndex: ${startIndex}, total for tier: ${wordsForTier.length}).`
@@ -344,74 +479,74 @@ const exportTier = async (tier: 1 | 2 | 3, batchSize = 30) => {
     } words for this batch (from index ${startIndex} to ${endIndex - 1}).`
   );
 
-  // Cache for WordNet lookups to avoid redundant API calls
   const wnCache = new Map<string, { def: string; syn: string[] }>();
-  const limit = pLimit(8); // Limit concurrent WordNet lookups for performance
+  const limit = pLimit(8); // Limit for WordNet lookups in export
 
-  // Asynchronously fetch definitions and synonyms from WordNet for each word in the batch
   const tasks = currentBatchList.map((entry) =>
     limit(async () => {
-      if (wnCache.has(entry.lemma)) return wnCache.get(entry.lemma)!; // Use cached result if available
+      if (wnCache.has(entry.lemma)) return wnCache.get(entry.lemma)!;
 
       let definition = '';
       let synonyms: string[] = [];
+
       try {
         const results: any[] = await lookupAsync(entry.lemma);
-        if (Array.isArray(results) && results.length) {
-          // Take the first part of the definition
-          definition = results[0].def.split(';')[0].trim();
 
-          // Process synonyms: flatten, trim, lowercase, remove underscores, ensure uniqueness
-          const rawSynonyms = results
-            .flatMap((r) => r.synonyms)
-            .map((s: string) => s.trim().toLowerCase().replace(/_/g, ' '));
-          const uniqueSynonyms = [...new Set(rawSynonyms)];
-          // Exclude the lemma itself from its synonyms
-          const filteredSynonyms = uniqueSynonyms.filter(
-            (s) => s !== entry.lemma.toLowerCase()
-          );
+        const best = pickBestSense(
+          results as WNResult[],
+          entry.pos // ← noun/verb/…
+        );
 
-          // Use filtered synonyms if available, otherwise fall back to unique ones (if lemma was the only synonym)
-          // Limit to a maximum of 3 synonyms
-          synonyms = (
-            filteredSynonyms.length ? filteredSynonyms : uniqueSynonyms
-          ).slice(0, 3);
+        if (best) {
+          definition = best.def.split(';')[0].trim();
+
+          // берём только синонимы той же POS
+          const synSetPos = mapWordNetPosToStandard(best.pos);
+          const raw = (results as WNResult[])
+            .filter((r) => mapWordNetPosToStandard(r.pos) === synSetPos)
+            .flatMap((r) => r.synonyms);
+
+          const uniq = [
+            ...new Set(
+              raw.map((s) => s.replace(/_/g, ' ').trim().toLowerCase())
+            ),
+          ];
+
+          synonyms = uniq
+            .filter((s) => s && s !== entry.lemma.toLowerCase())
+            .slice(0, 3); // макс. 3 шт.
         }
       } catch (err) {
         console.error(`Error looking up '${entry.lemma}' in WordNet:`, err);
       }
 
       const wordNetData = { def: definition, syn: synonyms };
-      wnCache.set(entry.lemma, wordNetData); // Cache the result
+      wnCache.set(entry.lemma, wordNetData);
       return wordNetData;
     })
   );
 
-  const wordNetResults = await Promise.all(tasks); // Execute all WordNet lookup tasks
+  const wordNetResults = await Promise.all(tasks);
 
-  // Prepare lines for the TSV (Tab-Separated Values) file
-  const deckLines = currentBatchList.map(
-    (entry, index) =>
-      [
-        `${entry.word} (${entry.pos || 'N/A'})`, // Field 1: Word (Part of Speech)
-        '', // Field 2: Placeholder (e.g., for audio, images)
-        wordNetResults[index].def, // Field 3: Definition
-        (entry.example ?? '').slice(0, 120), // Field 4: Example sentence (truncated)
-        wordNetResults[index].syn.join(', '), // Field 5: Synonyms (comma-separated)
-        `Tier${tier}·${entry.level}·Zipf ${entry.zipf.toFixed(2)}`, // Field 6: Tags
-      ].join('\t') // Join fields with a tab character
+  const deckLines = currentBatchList.map((entry, index) =>
+    [
+      `${entry.word} (${entry.pos || 'N/A'})`,
+      '',
+      wordNetResults[index].def,
+      (entry.example ?? '').slice(0, 120),
+      wordNetResults[index].syn.join(', '),
+      `Tier${tier}·${entry.level}·Zipf ${entry.zipf.toFixed(2)}`,
+    ].join('\t')
   );
 
   const deckDir = path.join(DATA_DIR, 'decks');
-  await fs.ensureDir(deckDir); // Ensure 'decks' directory exists (redundant if nextBatchId was called, but safe)
+  await fs.ensureDir(deckDir);
 
-  // Construct the filename for the deck
   const filename = path.join(
     deckDir,
     `deck_t${tier}_${pad(currentBatchNum)}.tsv`
   );
 
-  // Write the deck lines to the TSV file
   await fs.writeFile(filename, deckLines.join('\n'));
   console.log(
     `✓ Deck created: ${path.basename(filename)} (${deckLines.length} words)`
@@ -431,7 +566,6 @@ yargs(hideBin(process.argv))
       }),
     (argv) => {
       if (!argv.file) {
-        // Should be caught by demandOption, but good practice
         console.error(
           'Error: Missing required argument <file> for ingest command.'
         );
@@ -448,7 +582,7 @@ yargs(hideBin(process.argv))
         .option('tier', {
           describe: 'The learning tier to export words from.',
           type: 'number',
-          choices: [1, 2, 3] as const, // Ensure choices are treated as literal types
+          choices: [1, 2, 3] as const,
           demandOption: 'Please specify a tier (1, 2, or 3).',
         })
         .option('batch', {
@@ -457,17 +591,16 @@ yargs(hideBin(process.argv))
           default: 30,
         }),
     (argv) => {
-      // Type assertion for tier as yargs choices might not fully narrow it down
       const tier = argv.tier as 1 | 2 | 3;
-      const batchSize = argv.batch as number; // batch will have a default value
+      const batchSize = argv.batch as number;
       exportTier(tier, batchSize);
     }
   )
   .demandCommand(
-    1, // Require at least one command to be specified
+    1,
     'You need to specify at least one command (ingest or export).'
   )
-  .strict() // Catches unrecognized options or arguments
+  .strict()
   .help('h')
   .alias('h', 'help')
   .alias('v', 'version')
