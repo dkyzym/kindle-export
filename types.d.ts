@@ -14,3 +14,17 @@ interface WNResult {
   synonyms: string[];
   meta?: { freqCnt?: number }; // есть в wordnet-db
 }
+
+interface RawWord {
+  word: string;
+  stem?: string;
+  example?: string;
+  count?: number;
+}
+interface CleanEntry extends RawWord {
+  lemma: string;
+  level: string;
+  pos: string;
+  zipf: number;
+  tier: 1 | 2 | 3;
+}

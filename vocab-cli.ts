@@ -45,28 +45,6 @@ const SKIPPED_DUPLICATE_LEMMAS_FILE = path.join(
   'skipped_duplicate_lemmas.txt'
 );
 
-/* ────────────── Types ───────────────────────────────── */
-interface RawWord {
-  word: string;
-  stem?: string;
-  example?: string;
-  count?: number;
-}
-interface CleanEntry extends RawWord {
-  lemma: string;
-  level: string;
-  pos: string;
-  zipf: number;
-  tier: 1 | 2 | 3;
-}
-
-interface WNResult {
-  pos: string;
-  def: string;
-  synonyms: string[];
-  meta?: { freqCnt?: number }; // есть в wordnet-db
-}
-
 /* ────────────── Helpers ─────────────────────────────── */
 
 // ── выбрали наиболее частотный sense, желательно нужной POS ─────────
@@ -454,9 +432,41 @@ const exportTier = async (tier: 1 | 2 | 3, batchSize = 30) => {
     return;
   }
 
+  /* ──────────────────────────────────────────────────────────────── */
+  /* 0. Собираем леммы, которые уже оказались в готовых колодах      */
+  /*    deck_t{tier}_XX.tsv считаются «источником правды»             */
+  /* ──────────────────────────────────────────────────────────────── */
+
+  const deckDir = path.join(DATA_DIR, 'decks'); // единое имя в функции
+  await fs.ensureDir(deckDir);
+
+  const exported = new Set<string>();
+  const deckFiles = (await fs.readdir(deckDir)).filter(
+    (f) => f.startsWith(`deck_t${tier}_`) && f.endsWith('.tsv')
+  );
+
+  for (const f of deckFiles) {
+    const lines = (await fs.readFile(path.join(deckDir, f), 'utf8')).split(
+      /\r?\n/
+    );
+    for (const line of lines) {
+      const [firstCol] = line.split('\t'); // "word (pos)"
+      if (!firstCol) continue;
+      const lemma = firstCol.split(' ')[0].toLowerCase(); // до пробела
+      exported.add(lemma);
+    }
+  }
+
+  /**
+   * Сортируем слова сначала по частоте выделения, затем по числу Zipf в порядке убывания
+   */
   const wordsForTier = allCleanedWords
-    .filter((e) => e.tier === tier)
-    .sort((a, b) => (b.count ?? 0) - (a.count ?? 0));
+    .filter((e) => e.tier === tier && !exported.has(e.lemma))
+    .sort((a, b) => {
+      const diff = (b.count ?? 0) - (a.count ?? 0); // ① выделения
+      if (diff !== 0) return diff;
+      return (b.zipf ?? 0) - (a.zipf ?? 0); // ② Zipf: выше → раньше
+    });
 
   const currentBatchNum = await nextBatchId(tier);
   const startIndex = (currentBatchNum - 1) * batchSize;
@@ -539,8 +549,8 @@ const exportTier = async (tier: 1 | 2 | 3, batchSize = 30) => {
     ].join('\t')
   );
 
-  const deckDir = path.join(DATA_DIR, 'decks');
-  await fs.ensureDir(deckDir);
+  // const deckDir = path.join(DATA_DIR, 'decks');
+  // await fs.ensureDir(deckDir);
 
   const filename = path.join(
     deckDir,
