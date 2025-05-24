@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "ingest": "tsx vocab-cli.ts ingest words.json",
+    "ingest": "tsx vocab-cli.ts ingest ./data/words.json",
     "export": "tsx vocab-cli.ts export --tier 1 --batch 30",
     "export2": "tsx vocab-cli.ts export --tier 2 --batch 10",
     "download": "node export-kindle-words.js"
