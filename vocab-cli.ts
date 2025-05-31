@@ -28,6 +28,32 @@ import natural from 'natural';
 // @ts-ignore wordnet-db exports { path: string }
 import wordnetDb from 'wordnet-db';
 
+/* ─────────────── Types (Illustrative) ──────────────── */
+interface RawWord {
+  word: string;
+  example?: string;
+  count?: number; // How many times it was looked up/highlighted
+}
+
+interface CleanEntry extends RawWord {
+  lemma: string;
+  level: string; // CEFR level like A1, B2
+  pos: string; // Part of speech: noun, verb, adj, adv
+  zipf: number; // Zipf frequency score
+  tier: 1 | 2 | 3;
+}
+
+interface WNResult {
+  lemma: string;
+  pos: string; // n, v, a, r, s
+  synonyms: string[];
+  def: string;
+  meta?: {
+    freqCnt?: number; // WordNet sense frequency count
+  };
+  // ... other WordNet fields
+}
+
 /* ────────────── Paths ───────────────────────────────── */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -291,7 +317,7 @@ const ingest = async (filePath: string) => {
       const cefrDataForLemma = cefr[lemma];
       const z = zipf[wlower] ?? zipf[lemma] ?? 3.5;
 
-      // 1️⃣  ——— часть речи: WordNet → heur → CEFR ———
+      // 1️⃣   ——— часть речи: WordNet → heur → CEFR ———
       let finalPos = '';
 
       // (а) сначала WordNet с кэшем
@@ -348,7 +374,7 @@ const ingest = async (filePath: string) => {
         level: cefrDataForLemma?.level ?? 'B2',
         pos: finalPos, // Use the potentially WordNet-enhanced POS
         zipf: z,
-        tier: 3,
+        tier: 3, // Default tier, will be updated by decideTier
       };
       entry.tier = decideTier(entry);
       return entry;
@@ -434,7 +460,7 @@ const exportTier = async (tier: 1 | 2 | 3, batchSize = 30) => {
 
   /* ──────────────────────────────────────────────────────────────── */
   /* 0. Собираем леммы, которые уже оказались в готовых колодах      */
-  /*    deck_t{tier}_XX.tsv считаются «источником правды»             */
+  /* deck_t{tier}_XX.tsv считаются «источником правды»            */
   /* ──────────────────────────────────────────────────────────────── */
 
   const deckDir = path.join(DATA_DIR, 'decks'); // единое имя в функции
@@ -450,9 +476,10 @@ const exportTier = async (tier: 1 | 2 | 3, batchSize = 30) => {
       /\r?\n/
     );
     for (const line of lines) {
-      const [firstCol] = line.split('\t'); // "word (pos)"
+      const [firstCol] = line.split('\t'); // Now this will be just "word" for new files, or "word (pos)" for old files
       if (!firstCol) continue;
-      const lemma = firstCol.split(' ')[0].toLowerCase(); // до пробела
+      // This logic should still work: if "word (pos)", it takes "word". If just "word", it takes "word".
+      const lemma = firstCol.split(' ')[0].toLowerCase();
       exported.add(lemma);
     }
   }
@@ -469,8 +496,16 @@ const exportTier = async (tier: 1 | 2 | 3, batchSize = 30) => {
     });
 
   const currentBatchNum = await nextBatchId(tier);
+  // Corrected startIndex calculation: if currentBatchNum is 1, startIndex should be 0.
+  // The nextBatchId logic returns 1 for the first batch.
+  // So, if we want batches of 30:
+  // Batch 1: words 0-29
+  // Batch 2: words 30-59
+  // This means startIndex should be (currentBatchNum - 1) * batchSize
   const startIndex = (currentBatchNum - 1) * batchSize;
-  const endIndex = currentBatchNum * batchSize;
+  // endIndex is exclusive, so it's fine as currentBatchNum * batchSize
+  const endIndex = startIndex + batchSize; // Corrected: endIndex should be relative to startIndex
+
   const currentBatchList = wordsForTier.slice(startIndex, endIndex);
 
   console.log(
@@ -478,11 +513,18 @@ const exportTier = async (tier: 1 | 2 | 3, batchSize = 30) => {
   );
 
   if (!currentBatchList.length) {
-    console.warn(
-      `⚠ Tier ${tier} has no more words to export for batch #${currentBatchNum} (startIndex: ${startIndex}, total for tier: ${wordsForTier.length}).`
-    );
+    // Check if there are any words available for this tier at all
+    const totalWordsInTierNotExported = wordsForTier.length;
+    if (totalWordsInTierNotExported === 0) {
+      console.warn(`⚠ Tier ${tier} has no words left to export.`);
+    } else {
+      console.warn(
+        `⚠ Tier ${tier} has no more words to export for batch #${currentBatchNum} (startIndex: ${startIndex}, total available for tier: ${totalWordsInTierNotExported}). All words might have been exported in previous batches.`
+      );
+    }
     return;
   }
+
   console.log(
     `Selected ${
       currentBatchList.length
@@ -538,19 +580,18 @@ const exportTier = async (tier: 1 | 2 | 3, batchSize = 30) => {
 
   const wordNetResults = await Promise.all(tasks);
 
+  // MODIFIED PART: Constructing deckLines with separate POS field
   const deckLines = currentBatchList.map((entry, index) =>
     [
-      `${entry.word} (${entry.pos || 'N/A'})`,
-      '',
-      wordNetResults[index].def,
-      (entry.example ?? '').slice(0, 120),
-      wordNetResults[index].syn.join(', '),
-      `Tier${tier}·${entry.level}·Zipf ${entry.zipf.toFixed(2)}`,
+      entry.word, // Field 1: Word
+      entry.pos || 'N/A', // Field 2: Part of Speech (NEW)
+      '', // Field 3: (empty, for audio/image placeholder)
+      wordNetResults[index].def, // Field 4: Definition
+      (entry.example ?? '').slice(0, 120), // Field 5: Example
+      wordNetResults[index].syn.join(', '), // Field 6: Synonyms
+      `Tier${tier}·${entry.level}·Zipf ${entry.zipf.toFixed(2)}`, // Field 7: Tags/Metadata
     ].join('\t')
   );
-
-  // const deckDir = path.join(DATA_DIR, 'decks');
-  // await fs.ensureDir(deckDir);
 
   const filename = path.join(
     deckDir,
@@ -602,7 +643,7 @@ yargs(hideBin(process.argv))
         }),
     (argv) => {
       const tier = argv.tier as 1 | 2 | 3;
-      const batchSize = argv.batch as number;
+      const batchSize = argv.batch as number; // yargs ensures this is a number
       exportTier(tier, batchSize);
     }
   )
